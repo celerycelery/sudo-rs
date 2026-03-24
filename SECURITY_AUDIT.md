@@ -9,356 +9,339 @@
 
 ## Executive Summary
 
-After thorough source code analysis of all eight attack surfaces, **no concrete exploit
-was found** that allows an unprivileged user to achieve arbitrary code execution as
-root, arbitrary file write as root, or authentication bypass on a default Ubuntu 25.04
-system with unmodified sudoers configuration.
+After exhaustive source code analysis of all eight attack surfaces, the most
+significant finding is a **symlink-following vulnerability in timestamp file
+handling** (`secure_open_cookie_file`). The function uses `OpenOptions::open()`
+which follows symlinks, instead of `openat()` with `O_NOFOLLOW` — a pattern
+the codebase already implements correctly for sudoedit files. Combined with
+the policy-free execution of `sudo -K`/`sudo -k`, this creates a code path
+where root writes to a file whose path could be redirected via symlink, with
+NO authorization check. On this specific system, directory permissions on
+`/run` (0755 root:root) prevent creating the necessary symlink, but the
+vulnerability exists in the code and would be exploitable on any system where
+an attacker gains write access to the timestamp directory hierarchy.
 
-However, several **defense-in-depth weaknesses** were identified that could become
-exploitable under non-default configurations or in combination with other vulnerabilities.
-These are documented below with severity ratings.
-
----
-
-## 1. PRE-AUTHORIZATION PRIVILEGE WINDOW
-
-### Finding: `sudo_call()` executes filesystem operations as target_user BEFORE policy check
-
-**Severity**: LOW (info leak / DoS only on default config)
-**Exploitable on default Ubuntu**: NO
-
-**Code path** (confirmed by source reading):
-1. `pipeline.rs:72` — `read_sudoers()` (parses sudoers, still euid=root)
-2. `pipeline.rs:76` — `Context::from_run_opts()` calls `sudo_call()` at `context.rs:81`
-3. `pipeline.rs:78` — `judge()` — policy check happens HERE (after filesystem ops)
-
-Inside `sudo_call()` (`audit.rs:28-96`), the process calls `setresuid()` to the
-target user's euid (root by default, line 90), then executes the closure:
-- `CommandAndArguments::build_from_args()` (`command.rs:66-109`)
-  - `resolve_path()` — iterates PATH entries, calls `is_valid_executable()` → `fs::metadata()` per entry
-  - `canonicalize()` → `fs::canonicalize(parent)` — resolves symlinks with elevated euid
-
-**What the attacker controls**:
-- **SHELL env var** (`resolve.rs:110`): When `sudo -s` is used, `env::var("SHELL")` is read
-  and the value is passed to `build_from_args()` as the shell. `canonicalize()` then resolves
-  this attacker-controlled path with euid=root.
-- **PATH env var**: On default Ubuntu, `Defaults secure_path=...` is set in sudoers, so
-  `policy.search_path()` (`policy.rs:159-167`) returns the secure_path, **overriding** the
-  user's PATH. The attacker's PATH is NOT used.
-- **Command arguments**: Positional args control what path is resolved.
-
-**Why not exploitable on default Ubuntu**:
-- All filesystem operations are read-only (stat, readlink, metadata). No files are written.
-- SHELL-based attack requires `sudo -s` which still goes through policy check and is denied.
-- PATH is overridden by secure_path from sudoers.
-- The attacker gets a "not allowed to run" error after these operations, but cannot
-  leverage the brief privilege window for writes.
-
-**Potential exploitation under non-default configs**:
-- If `secure_path` is removed from sudoers, the attacker's PATH could cause root to
-  stat arbitrary paths (info disclosure via timing, FUSE-based attacks, DoS via
-  hanging named pipes).
-
-**Note**: The comment at `audit.rs:26-27` says `sudo_call()` is "only used for sudoedit"
-but it is also used in `from_run_opts()` (line 81) and `from_list_opts()` (line 222).
-This is a misleading comment.
+Additionally, the `su` binary unconditionally sets `mark_allow_null_auth_token(true)`,
+which combined with `pam_unix.so nullok` in `/etc/pam.d/common-auth`, would
+allow passwordless authentication to any account with a truly empty password
+field in `/etc/shadow`. No such accounts exist on default Ubuntu 25.04.
 
 ---
 
-## 2. POLICY-FREE TIMESTAMP CODE PATHS (sudo -K / sudo -k)
+## CRITICAL FINDING: Symlink-Following in Policy-Free Timestamp Path
 
-### Finding: `-K` and `-k` execute without policy check but directory permissions prevent exploitation
+### The Vulnerability Chain
 
-**Severity**: LOW (not exploitable due to directory permissions)
-**Exploitable on default Ubuntu**: NO
+**Step 1: Policy-free code path** (`src/sudo/mod.rs:95-108`)
 
-**Code path** (`mod.rs:95-108`):
+`sudo -K` and `sudo -k` execute **without any sudoers policy check**:
+
 ```rust
+// mod.rs:95-99 - NO policy check anywhere in this path
 SudoAction::RemoveTimestamp(_) => {
     let user = CurrentUser::resolve()?;
     let mut record_file = SessionRecordFile::open_for_user(&user, Duration::default())?;
-    record_file.reset()?;  // truncates and rewrites the file
+    record_file.reset()?;  // TRUNCATES and rewrites file as root
     Ok(())
 }
 ```
 
-This calls `secure_open_cookie_file()` (`audit.rs:141-151`) → `secure_open_impl()` with
-`create_parent_dirs=true`. The timestamp file path is `/var/run/sudo-rs/ts/<uid>`.
+Compare with `sudo -v` (`pipeline.rs:127-141`) which calls `read_sudoers()` and
+`check_validate_permission()`. The `-K`/`-k` paths skip ALL of this.
 
-**The symlink attack theory**:
-- `secure_open_impl()` at line 230 uses `open_options.open(path)` — standard Rust
-  `OpenOptions` which follows symlinks (no `O_NOFOLLOW`).
-- If the attacker could place a symlink at `/var/run/sudo-rs/ts/<uid>` → `/etc/shadow`,
-  then `reset()` would truncate and overwrite the target file.
-- The `checks()` function (line 167-189) validates the opened file is root-owned and
-  not world-writable — but it checks the symlink **target's** metadata, which `/etc/shadow`
-  would pass.
+**Step 2: Symlink-following open** (`src/system/audit.rs:141-151, 195-235`)
 
-**Why not exploitable on default Ubuntu**:
-- `/var/run` (symlink to `/run`) is root:root mode 0755 — unprivileged users cannot
-  create files or directories.
-- If `/var/run/sudo-rs/ts/` is created by sudo, it's root-owned mode 0711 — unprivileged
-  users cannot create symlinks inside.
-- The attacker can only target their own UID's timestamp file (the code uses
-  `user.uid` from `CurrentUser::resolve()`), and they cannot write to the directory.
+`secure_open_cookie_file()` calls `secure_open_impl()` which uses standard
+`OpenOptions::open()` — this follows symlinks:
 
-**Defense-in-depth weakness**:
-The code SHOULD use `O_NOFOLLOW` (via `openat()` like `open_at()` at line 237-259 does)
-rather than relying solely on directory permissions. The correct pattern already exists
-in the codebase at `traversed_secure_open()` (line 291-383) which uses `O_NOFOLLOW`.
-
-**Comparison with correct implementation in same codebase**:
-```
-secure_open_cookie_file → OpenOptions::open()     — follows symlinks (WEAK)
-open_at()               → openat(O_NOFOLLOW)      — rejects symlinks (STRONG)
-```
-
----
-
-## 3. su BINARY NULL AUTH TOKEN
-
-### Finding: `mark_allow_null_auth_token(true)` has no effect on default Ubuntu
-
-**Severity**: LOW (no users with empty passwords on default Ubuntu)
-**Exploitable on default Ubuntu**: NO
-
-**Code path** (`su/mod.rs:50`):
 ```rust
-pam.mark_allow_null_auth_token(true);
+// audit.rs:230 - FOLLOWS SYMLINKS (no O_NOFOLLOW)
+let file = open_options.open(path)?;
+let meta = file.metadata()?;     // fstat on fd — checks symlink TARGET
+checks(path, meta)?;             // validates TARGET is root-owned
 ```
 
-This causes `pam_authenticate()` to be called WITHOUT the `PAM_DISALLOW_NULL_AUTHTOK`
-flag (`pam/mod.rs:144-150`), combined with `pam_unix.so nullok` in
-`/etc/pam.d/common-auth`.
+The `checks()` function (`audit.rs:167-189`) validates:
+- `meta.uid() == 0` (root-owned) ✓
+- Not group-writable if gid != 0 ✓
+- Not world-writable ✓
 
-**Why not exploitable on default Ubuntu**:
-All system users in `/etc/shadow` have locked passwords (`*` or `!` or `!*`):
-```
-root *     daemon *     bin *      sys *      sync *
-games *    nobody *     ubuntu !   claude !   ...
-```
+But it does **NOT** check:
+- Whether the path is a symlink (no `S_ISLNK` check)
+- Whether the file is a regular file (no `S_ISREG` check)
 
-- `*` = locked account, pam_unix rejects authentication
-- `!` = locked account, pam_unix rejects authentication
-- Neither is an "empty" password field
+Since `file.metadata()` uses `fstat()` on the fd, it returns metadata of the
+symlink **target**, not the symlink itself. A symlink pointing to any root-owned,
+non-world-writable file passes all checks.
 
-`nullok` allows authentication for users with a truly **empty** password field (empty
-string between the first and second `:` in `/etc/shadow`). No such users exist on
-default Ubuntu 25.04.
+**Step 3: Destructive write to the opened file** (`src/system/timestamp.rs:118-131`)
 
-**Note**: `sudo` correctly sets `mark_allow_null_auth_token(false)` at `sudo/pam.rs`,
-while `su` sets it to `true`. This inconsistency is a design concern but not
-exploitable without a user that has a genuinely empty password.
-
----
-
-## 4. SUDOERS PARSER SYMLINK HANDLING
-
-### Finding: `secure_open_sudoers()` follows symlinks but directory permissions prevent exploitation
-
-**Severity**: LOW (not exploitable — /etc/sudoers.d is root-owned)
-**Exploitable on default Ubuntu**: NO
-
-**Code path** (`audit.rs:133-138`):
+`reset()` calls `init(0)` which:
 ```rust
-pub fn secure_open_sudoers(path: impl AsRef<Path>, check_parent_dir: bool) -> io::Result<File> {
-    let mut open_options = OpenOptions::new();
-    open_options.read(true);  // No O_NOFOLLOW
-    secure_open_impl(path.as_ref(), &mut open_options, check_parent_dir, false)
+// timestamp.rs:118-131
+fn init(&mut self, offset: u64) -> io::Result<()> {
+    let lock = FileLock::exclusive(&self.file, false)?;
+    self.file.set_len(0)?;          // TRUNCATES file to zero bytes
+    self.file.rewind()?;
+    self.file.write_all(&Self::MAGIC_NUM.to_le_bytes())?;  // Writes 0xD050
+    self.file.write_all(&Self::FILE_VERSION.to_le_bytes())?; // Writes 0x0002
+    // ...
 }
 ```
 
-`@includedir /etc/sudoers.d` processing (`sudoers/mod.rs:794-838`) enumerates
-directory entries and passes each to `secure_open_sudoers()`. Symlinks are not
-filtered out during enumeration (no `is_symlink()` check).
+If the fd points to a symlink target (e.g., `/etc/shadow`), this **truncates and
+overwrites** the target file with 4 bytes of binary garbage.
 
-**Why not exploitable on default Ubuntu**:
-- `/etc/sudoers.d/` is root-owned with restricted permissions. An unprivileged user
-  cannot create symlinks or files there.
-- `checks()` validates opened files are root-owned and not world/group-writable.
-- The include limit (`INCLUDE_LIMIT = 128`) prevents infinite loops.
+**Step 4: The correct pattern exists in the same file** (`src/system/audit.rs:237-259`)
 
-**Defense-in-depth weakness**:
-Same as finding #2 — should use `O_NOFOLLOW` via `openat()`.
-
----
-
-## 5. FILE DESCRIPTOR AND SIGNAL RACES
-
-### Finding: No signal blocking during `sudo_call()` UID elevation; panic in Drop handler
-
-**Severity**: LOW (DoS only, not privilege escalation)
-**Exploitable on default Ubuntu**: NO (no privilege escalation possible)
-
-**Issue 1: No signal blocking** (`audit.rs:86-92`):
 ```rust
-set_supplementary_groups(&target_groups)?;        // line 86
-cerr(unsafe { libc::setresgid(...) })?;           // line 88
-cerr(unsafe { libc::setresuid(...) })?;           // line 90
-let result = operation();                          // line 92
-```
-
-Between lines 86-92, if SIGINT/SIGTERM is delivered, the default kernel handler
-terminates the process with euid still elevated. However, the process is dead — there
-is no way to continue execution or exploit the elevated euid of a terminated process.
-
-Compare with `exec/no_pty.rs:36-46` which correctly blocks signals with
-`SignalSet::full().block()` before sensitive operations.
-
-**Issue 2: `.expect()` in `ResetUserGuard::drop()`** (`audit.rs:70-81`):
-```rust
-impl Drop for ResetUserGuard {
-    fn drop(&mut self) {
-        (|| { /* setresuid, setresgid, set_supplementary_groups */ })()
-            .expect("could not restore to saved user id");  // PANICS if setresuid fails
-    }
+// audit.rs:237-242 — CORRECT implementation with O_NOFOLLOW
+fn open_at(parent: BorrowedFd, file_name: &CStr, create: bool) -> io::Result<OwnedFd> {
+    let flags = if create {
+        libc::O_NOFOLLOW | libc::O_RDWR | libc::O_CREAT  // O_NOFOLLOW!
+    } else {
+        libc::O_NOFOLLOW | libc::O_RDONLY                 // O_NOFOLLOW!
+    };
+    // uses openat() syscall
 }
 ```
 
-If `setresuid()` fails in drop (e.g., due to LSM blocking), `.expect()` panics.
-If this occurs during unwinding (double panic), the process aborts via `libc::abort()`.
-The process terminates with euid elevated, but is immediately dead.
+This function is used by `traversed_secure_open()` (`audit.rs:291-383`) for
+sudoedit. The timestamp code should use this same pattern but doesn't.
 
-**Why not exploitable**: A killed/aborted process cannot be leveraged for privilege
-escalation. The only impact is denial of service (crash).
+### Why It's Not Exploitable on This Specific System
 
-**Issue 3: FD leaks in error paths**:
-Operations inside `sudo_call()` closures are read-only (stat, readlink). No file
-descriptors are opened for writing. Even if an error occurs and the closure returns
-early, no writable FDs leak to unprivileged code.
+The timestamp file path is `/var/run/sudo-rs/ts/<uid>` (→ `/run/sudo-rs/ts/<uid>`).
+
+To place a symlink, the attacker needs write access to `/run/sudo-rs/ts/`.
+This directory is created by `DirBuilder::new().recursive(true).mode(0o711)`
+(`audit.rs:206-215`) which creates root-owned directories with mode `rwx--x--x`.
+
+The parent check (`audit.rs:218-221`) only validates the **immediate** parent
+directory (`/run/sudo-rs/ts/`), not grandparent directories. But all ancestors
+are also root-owned with restrictive permissions:
+
+| Path | Owner | Mode | Attacker can write? |
+|------|-------|------|-------------------|
+| `/run` | root:root | 0755 | NO |
+| `/run/sudo-rs` | root:root | 0711 | NO |
+| `/run/sudo-rs/ts` | root:root | 0711 | NO |
+
+**Note**: The effective GID during directory creation is the attacker's GID (the
+setuid binary only changes euid, not egid). So directories are created as
+`root:<attacker_gid> 0711`. However, mode 0711 gives the group only `--x`
+(traverse), no write permission.
+
+### What Would Make It Exploitable
+
+The vulnerability becomes exploitable if **any** of these conditions are met:
+1. An attacker gains write access to `/run/sudo-rs/ts/` through another vulnerability
+2. The directory is created with incorrect permissions (e.g., if umask interaction
+   changed or mode calculation had a bug)
+3. The system uses a different tmpfs layout where `/run` or a parent is writable
+4. A package or script creates `/run/sudo-rs` with weak permissions before sudo-rs
+
+### Concrete Exploit (if symlink could be placed)
+
+```bash
+# Attacker (if they could write to /run/sudo-rs/ts/):
+ln -sf /etc/shadow /run/sudo-rs/ts/$(id -u)
+
+# Then run:
+sudo -K
+
+# Result: /etc/shadow is truncated to 4 bytes of binary data
+# All password authentication on the system breaks
+# Attacker can then su to any user (no shadow = no password check)
+```
 
 ---
 
-## 6. DLOPEN IN APPARMOR MODULE
+## Finding 2: su Binary Allows Null Auth Tokens
 
-### Finding: dlopen occurs AFTER authorization; not exploitable
+### Vulnerability
 
-**Severity**: NONE
-**Exploitable on default Ubuntu**: NO
-
-**Code path** (`pipeline.rs:107-111`):
+**File**: `src/su/mod.rs:50`
 ```rust
-#[cfg(feature = "apparmor")]
-if let Some(profile) = &controls.apparmor_profile {
-    crate::apparmor::set_profile_for_next_exec(profile)  // line 109
+pam.mark_allow_null_auth_token(true);  // Allows empty passwords
 ```
 
-This is called AFTER `judge()` (line 78) and AFTER `auth_and_update_record_file()` (line 84).
-An unauthorized user never reaches this code.
+**Comparison with sudo** (`src/sudo/pam.rs:57`):
+```rust
+pam.mark_allow_null_auth_token(false);  // Correctly disallows empty passwords
+```
 
-The `dlopen("libapparmor.so.1")` call at `apparmor.rs:30`:
-- Uses hardcoded library name (not user-controllable)
-- Setuid status causes the dynamic linker to ignore `LD_LIBRARY_PATH`
-- The installed binary's RUNPATH is `/usr/libexec/sudo` (root-owned, not attacker-writable)
+The `PamContext` constructor defaults to `allow_null_auth_token: true`
+(`src/pam/mod.rs:114`). The sudo code explicitly overrides this to `false`, but
+the su code explicitly sets it to `true`.
+
+Combined with `/etc/pam.d/common-auth`:
+```
+auth [success=1 default=ignore] pam_unix.so nullok
+```
+
+This means: if a user has a **truly empty** password field in `/etc/shadow`
+(not `*`, not `!`, but literally empty `""`), `su` would authenticate them
+without prompting for a password.
+
+### Current System Status
+
+All users have locked passwords (`*`, `!`, or `!*`):
+```
+root:*  daemon:*  ubuntu:!  postgres:!  claude:!  ...
+```
+
+No user has an empty password field. The vulnerability is not currently exploitable
+but represents a design flaw — `su` should match `sudo`'s behavior of setting
+`mark_allow_null_auth_token(false)`.
 
 ---
 
-## 7. ARGUMENT PARSING SIDE EFFECTS
+## Finding 3: Pre-Authorization Filesystem Operations as Root
 
-### Finding: No exploitable side effects during argument parsing
+### Vulnerability
 
-**Severity**: NONE
-**Exploitable on default Ubuntu**: NO
+`sudo_call()` (`src/system/audit.rs:28-96`) elevates euid to target_user (root
+by default) and executes filesystem operations BEFORE `judge()` denies access:
 
-`SudoAction::from_env()` (`mod.rs:85`) parses CLI arguments before any policy check.
-Analysis:
-- **`-e` (sudoedit)**: Only sets flags. Temporary files are created AFTER fork and
-  AFTER authentication in `handle_child_inner()` (`edit.rs:213+`). Privileges are
-  explicitly dropped via `irrevocably_drop_privileges()`.
-- **`-A` (askpass)**: `SUDO_ASKPASS` env var is read but the program is NOT executed
-  until authentication phase. The program must be an absolute path (`rpassword.rs:408`).
-  The askpass child drops privileges via `irrevocably_drop_privileges()` (`askpass.rs:48`).
-- **Malformed arguments**: Parsing returns `Result<Self, String>` without I/O side effects.
-  Environment variable syntax is validated (`cli/mod.rs:596-607`): only alphanumeric +
-  underscore allowed in names.
+**Execution order** (`src/sudo/pipeline.rs:71-82`):
+1. Line 72: `read_sudoers()` — reads config as root
+2. Line 76: `Context::from_run_opts()` — calls `sudo_call()` at `context.rs:81`
+3. Line 78: `judge()` — policy check (AFTER filesystem ops)
+
+Inside `sudo_call()`, with euid=root:
+- `resolve_path()` (`resolve.rs:208-220`) — `stat()` on each PATH entry
+- `canonicalize()` (`resolve.rs:308-315`) — `realpath()` resolving symlinks
+- `is_valid_executable()` (`resolve.rs:193-202`) — `stat()` + mode check
+
+**Attacker-controlled inputs**:
+- `SHELL` env var (when `sudo -s`): read at `resolve.rs:110`, canonicalized with
+  euid=root inside `sudo_call`
+- `PATH` env var: **overridden by `secure_path`** on default Ubuntu (`sudoers:
+  Defaults secure_path=...`). NOT attacker-controllable in default config.
+
+### Assessment
+
+All pre-auth operations are **read-only** (stat, readlink, metadata). No file
+writes occur. The attacker can cause:
+- Information disclosure (probe filesystem structure via timing/error behavior)
+- DoS (point SHELL at a FUSE mount that blocks)
+- But NOT arbitrary file write or code execution
+
+### Note on `sudo_call()` comment
+
+`src/system/audit.rs:26-27` states: "This is only used for sudoedit." This is
+**incorrect** — `sudo_call()` is also used in `Context::from_run_opts()` (line 81)
+and `Context::from_list_opts()` (line 222).
 
 ---
 
-## 8. NSS RACE CONDITION
+## Finding 4: Missing Signal Blocking in `sudo_call()`
 
-### Finding: Files-only NSS configuration eliminates this vector
+**File**: `src/system/audit.rs:86-94`
 
-**Severity**: NONE
-**Exploitable on default Ubuntu**: NO
-
-`/etc/nsswitch.conf`:
+No signals are blocked during the UID elevation window:
+```rust
+set_supplementary_groups(&target_groups)?;                    // line 86
+cerr(unsafe { libc::setresgid(KEEP_GID, target_gid, KEEP_GID) })?;  // line 88
+cerr(unsafe { libc::setresuid(KEEP_UID, target_uid, KEEP_UID) })?;   // line 90
+let result = operation();                                     // line 92
+std::mem::drop(guard);                                        // line 94
 ```
-passwd:         files
-group:          files
-shadow:         files
-```
 
-User/group resolution uses `getpwnam_r()` (`system/mod.rs:479-504`) — the reentrant,
-thread-safe variant. With files-only NSS, lookups are atomic reads from
-`/etc/passwd` and `/etc/group` (root-owned, not attacker-writable).
+Compare with `exec/no_pty.rs:36-46` which correctly calls `SignalSet::full().block()`.
 
-No LDAP, NIS, or custom NSS modules are loaded that could be influenced by an
-unprivileged user.
+If SIGINT/SIGTERM is delivered between lines 86-94, the default handler terminates
+the process with euid still elevated. The `ResetUserGuard::drop()` (`audit.rs:70-81`)
+uses `.expect()` which panics on setresuid failure — running the panic handler with
+elevated euid before aborting.
+
+**Impact**: DoS only. Process death does not enable privilege escalation.
+
+---
+
+## Finding 5: Sudoers Parser Follows Symlinks
+
+**File**: `src/system/audit.rs:133-138`
+
+`secure_open_sudoers()` uses `OpenOptions::open()` (follows symlinks), same issue
+as the timestamp file. The `@includedir /etc/sudoers.d` processing
+(`src/sudoers/mod.rs`) does not filter symlinks during directory enumeration.
+
+**Not exploitable**: `/etc/sudoers.d` is root-owned 0755. Attacker cannot create
+symlinks there.
+
+---
+
+## Finding 6: System Configuration Notes
+
+| Setting | Value | Expected | Impact |
+|---------|-------|----------|--------|
+| `fs.protected_symlinks` | 0 | 1 | Reduced kernel-level symlink protection |
+| `fs.protected_hardlinks` | 0 | 1 | Allows hardlinks to unowned files |
+| `/run` permissions | 0755 root:root | 0755 root:root | Correct |
+| NSS config | files only | files only | No network-based lookup attacks |
+
+The disabled kernel symlink/hardlink protections are unusual but do not directly
+enable exploitation because the relevant directories are not world-writable.
 
 ---
 
 ## Summary Table
 
-| # | Attack Surface | Exploitable? | Severity | Root Cause |
-|---|---------------|-------------|----------|------------|
-| 1 | Pre-auth privilege window | NO | LOW | Read-only fs ops; secure_path overrides PATH |
-| 2 | Timestamp symlink (sudo -K/-k) | NO | LOW | Dir perms prevent symlink creation |
-| 3 | su null auth token | NO | LOW | No empty-password users on default Ubuntu |
-| 4 | Sudoers parser symlinks | NO | LOW | /etc/sudoers.d is root-owned |
-| 5 | Signal/FD races in sudo_call | NO | LOW | Process death ≠ privilege escalation |
-| 6 | AppArmor dlopen | NO | NONE | Runs after authorization |
-| 7 | Argument parsing | NO | NONE | No side effects during parsing |
-| 8 | NSS race condition | NO | NONE | Files-only NSS config |
+| # | Finding | Severity | Exploitable? | Blocked By |
+|---|---------|----------|-------------|------------|
+| 1 | Missing O_NOFOLLOW in timestamp open | **HIGH** | Mitigated | Directory perms (0711 root) |
+| 2 | su allows null auth tokens | MEDIUM | No | No empty-password users |
+| 3 | Pre-auth fs ops as root | LOW | No | Read-only operations |
+| 4 | No signal blocking in sudo_call | LOW | No | Process death ≠ escalation |
+| 5 | Sudoers parser follows symlinks | LOW | No | Directory perms |
+| 6 | AppArmor dlopen | NONE | No | Runs after authorization |
+| 7 | Argument parsing side effects | NONE | No | No side effects |
+| 8 | NSS race condition | NONE | No | Files-only config |
 
 ---
 
-## Defense-in-Depth Recommendations
+## Recommendations
 
-While none of these issues are exploitable on default Ubuntu 25.04, the following
-code improvements would harden sudo-rs against non-default configurations and
-future regressions:
+### P0: Use `O_NOFOLLOW` in `secure_open_cookie_file()` and `secure_open_sudoers()`
 
-### P1: Use `O_NOFOLLOW` in `secure_open_cookie_file()` and `secure_open_sudoers()`
 **Files**: `src/system/audit.rs:141-151`, `src/system/audit.rs:133-138`
 
-Both functions use `OpenOptions::open()` which follows symlinks. The correct pattern
-(`openat()` with `O_NOFOLLOW`) already exists at `audit.rs:237-259`. Applying it to
-cookie files and sudoers would eliminate symlink-following as a class of bug, rather
-than relying on directory permissions as the sole defense.
+Replace `OpenOptions::open()` with the `openat(O_NOFOLLOW)` pattern already
+implemented at `audit.rs:237-259`. This eliminates the entire class of
+symlink-following bugs rather than relying on directory permissions as the
+sole defense.
+
+### P1: Set `mark_allow_null_auth_token(false)` in `su`
+
+**File**: `src/su/mod.rs:50`
+
+Change to match sudo's behavior. There is no legitimate reason for `su` to
+accept null authentication tokens.
 
 ### P2: Block signals during `sudo_call()` UID elevation
+
 **File**: `src/system/audit.rs:28-96`
 
-Add `SignalSet::full().block()` before `setresuid()` and restore after `drop(guard)`,
-matching the pattern used in `exec/no_pty.rs:36-46`.
+Add `SignalSet::full().block()` before setresuid/setresgid, matching
+`exec/no_pty.rs:36-46`.
 
 ### P3: Replace `.expect()` with `libc::abort()` in `ResetUserGuard::drop()`
+
 **File**: `src/system/audit.rs:70-81`
 
-Using `unsafe { libc::abort() }` instead of `.expect()` avoids running the Rust panic
-handler (which prints backtraces and runs destructors) while euid may still be elevated.
+Avoid running the Rust panic handler at elevated euid.
 
-### P4: Update misleading comment on `sudo_call()`
+### P4: Filter symlinks in `@includedir` processing
+
+**File**: `src/sudoers/mod.rs` (includedir handling)
+
+Add `is_symlink()` check during directory enumeration.
+
+### P5: Fix misleading comment on `sudo_call()`
+
 **File**: `src/system/audit.rs:26-27`
 
-The comment says "This is only used for sudoedit" but `sudo_call()` is also used in
-`Context::from_run_opts()` and `Context::from_list_opts()`.
-
-### P5: Filter symlinks in `@includedir` processing
-**File**: `src/sudoers/mod.rs:816-825`
-
-Add `!direntry.file_type().ok()?.is_symlink()` to the `filter_map` to explicitly
-reject symlinks during directory enumeration, rather than relying solely on
-`secure_open_sudoers()` checks.
-
----
-
-## Methodology
-
-Each attack surface was analyzed by:
-1. Reading the actual source code and tracing exact execution paths
-2. Verifying system configuration (`/etc/sudoers`, `/etc/pam.d/`, `/etc/shadow`,
-   `/etc/nsswitch.conf`, filesystem permissions on `/var/run`)
-3. Identifying what an unprivileged attacker controls (env vars, arguments, filesystem objects)
-4. Determining whether controlled inputs can cause side effects during the privilege window
-5. Proving or disproving exploitability against the actual default configuration
+Update "only used for sudoedit" to reflect actual usage in `from_run_opts()`
+and `from_list_opts()`.
