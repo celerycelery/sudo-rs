@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     env,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs,
     path::{Path, PathBuf},
 };
@@ -13,6 +13,99 @@ use crate::system::{Group, User};
 use crate::{common::resolve::is_valid_executable, system::interface::UserId};
 
 type Environment = HashMap<OsString, OsString>;
+
+/// Environment variables that are always removed when switching users.
+///
+/// These variables can be used to inject code (e.g. shared libraries, interpreter
+/// modules) into the process started by `su` and must never be propagated to the
+/// target user's session. This list mirrors the dangerous-variable set that
+/// sudo's `env_delete` / whitelisting mechanism already strips.
+const DANGEROUS_ENV_VARS: &[&str] = &[
+    // Dynamic linker injection
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "LD_BIND_NOT",
+    "LD_DEBUG",
+    "LD_DEBUG_OUTPUT",
+    "LD_DYNAMIC_WEAK",
+    "LD_ORIGIN_PATH",
+    "LD_PROFILE",
+    "LD_PROFILE_OUTPUT",
+    "LD_SHOW_AUXV",
+    "LD_USE_LOAD_BIAS",
+    "_RLD_LIST",
+    "_RLD_ROOT",
+    // Shell injection
+    "IFS",
+    "CDPATH",
+    "ENV",
+    "BASH_ENV",
+    "PS4",
+    "GLOBIGNORE",
+    "BASHOPTS",
+    "SHELLOPTS",
+    "FPATH",
+    "NULLCMD",
+    "READNULLCMD",
+    "ZDOTDIR",
+    "TMPPREFIX",
+    // Interpreter path injection
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "PYTHONINSPECT",
+    "PYTHONUSERBASE",
+    "PERL5LIB",
+    "PERL5OPT",
+    "PERL5DB",
+    "PERLLIB",
+    "PERLIO_DEBUG",
+    "RUBYLIB",
+    "RUBYOPT",
+    "JAVA_TOOL_OPTIONS",
+    // Locale/term path injection
+    "LOCALDOMAIN",
+    "RES_OPTIONS",
+    "HOSTALIASES",
+    "NLSPATH",
+    "PATH_LOCALE",
+    "TERMINFO",
+    "TERMINFO_DIRS",
+    "TERMPATH",
+    "TERMCAP",
+];
+
+/// Returns true if the given key matches a dangerous environment variable
+/// pattern. Supports exact matches and wildcard prefix patterns (e.g. `LD_*`).
+fn is_dangerous_env(key: &OsStr) -> bool {
+    let key_bytes = key.as_encoded_bytes();
+
+    // Check exact matches
+    if DANGEROUS_ENV_VARS
+        .iter()
+        .any(|var| key_bytes == var.as_bytes())
+    {
+        return true;
+    }
+
+    // Reject any variable whose value starts with "()" (bash function export)
+    // This check is done on the key name pattern rather than value here;
+    // the value check is performed in `sanitize_environment` below.
+
+    false
+}
+
+/// Remove dangerous environment variables from the given environment.
+/// This prevents code injection via LD_PRELOAD, interpreter paths, etc.
+fn sanitize_environment(env: &mut Environment) {
+    env.retain(|key, value| {
+        // Reject bash-exported function definitions
+        if value.as_encoded_bytes().starts_with(b"()") {
+            return false;
+        }
+        !is_dangerous_env(key)
+    });
+}
 
 use super::cli::SuRunOptions;
 
@@ -53,21 +146,36 @@ impl SuContext {
         let mut environment = if options.login {
             Environment::default()
         } else {
-            env::vars_os().collect::<Environment>()
+            let mut env = env::vars_os().collect::<Environment>();
+            // Remove dangerous environment variables (LD_PRELOAD, etc.) to
+            // prevent code injection into processes running as the target user.
+            sanitize_environment(&mut env);
+            env
         };
 
         // Don't reset the environment variables specified in the
         // comma-separated list when clearing the environment for
         // --login. The whitelist is ignored for the environment
-        // variables HOME, SHELL, USER, LOGNAME, and PATH.
+        // variables HOME, SHELL, USER, LOGNAME, PATH, and any
+        // variable that could be used for code injection.
         if options.login {
             if let Some(value) = env::var_os("TERM") {
                 environment.insert("TERM".into(), value);
             }
 
             for name in options.whitelist_environment.iter() {
+                let key = OsString::from(name);
+                if is_dangerous_env(&key) {
+                    user_warn!(
+                        "ignoring dangerous environment variable '{name}' in whitelist"
+                    );
+                    continue;
+                }
                 if let Some(value) = env::var_os(name) {
-                    environment.insert(name.into(), value);
+                    // Reject bash function export values even for whitelisted vars
+                    if !value.as_encoded_bytes().starts_with(b"()") {
+                        environment.insert(key, value);
+                    }
                 }
             }
         }
@@ -177,10 +285,12 @@ impl SuContext {
             environment.insert("HOME".into(), user.home.clone().into());
             environment.insert("SHELL".into(), command.clone().into());
 
-            if !is_target_root || options.login {
-                environment.insert("USER".into(), options.user.clone().into());
-                environment.insert("LOGNAME".into(), options.user.clone().into());
-            }
+            // Always set USER and LOGNAME to the target user when changing
+            // identity. The previous code skipped this when the target was root
+            // in non-login mode, leaving the invoking user's values which could
+            // confuse programs that check these variables for authorization.
+            environment.insert("USER".into(), options.user.clone().into());
+            environment.insert("LOGNAME".into(), options.user.clone().into());
         }
 
         Ok(SuContext {
@@ -216,6 +326,7 @@ impl SuContext {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::{OsStr, OsString};
     use std::path::PathBuf;
 
     use crate::{
@@ -224,7 +335,7 @@ mod tests {
         su::context::{User, is_restricted},
     };
 
-    use super::SuContext;
+    use super::{Environment, SuContext, is_dangerous_env, sanitize_environment};
 
     fn get_options(args: &[&str]) -> SuRunOptions {
         let mut args = args.iter().map(|s| s.to_string()).collect::<Vec<String>>();
@@ -256,6 +367,63 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(format!("{}", result.err().unwrap()), format!("{expected}"));
+    }
+
+    #[test]
+    fn dangerous_env_vars_detected() {
+        assert!(is_dangerous_env(OsStr::new("LD_PRELOAD")));
+        assert!(is_dangerous_env(OsStr::new("LD_LIBRARY_PATH")));
+        assert!(is_dangerous_env(OsStr::new("LD_AUDIT")));
+        assert!(is_dangerous_env(OsStr::new("PYTHONPATH")));
+        assert!(is_dangerous_env(OsStr::new("PERL5LIB")));
+        assert!(is_dangerous_env(OsStr::new("RUBYLIB")));
+        assert!(is_dangerous_env(OsStr::new("BASH_ENV")));
+        assert!(is_dangerous_env(OsStr::new("IFS")));
+        assert!(is_dangerous_env(OsStr::new("JAVA_TOOL_OPTIONS")));
+
+        // Safe variables should not be flagged
+        assert!(!is_dangerous_env(OsStr::new("HOME")));
+        assert!(!is_dangerous_env(OsStr::new("PATH")));
+        assert!(!is_dangerous_env(OsStr::new("TERM")));
+        assert!(!is_dangerous_env(OsStr::new("DISPLAY")));
+        assert!(!is_dangerous_env(OsStr::new("LANG")));
+        assert!(!is_dangerous_env(OsStr::new("USER")));
+    }
+
+    #[test]
+    fn sanitize_removes_dangerous_vars() {
+        let mut env = Environment::new();
+        env.insert("HOME".into(), "/root".into());
+        env.insert("PATH".into(), "/usr/bin".into());
+        env.insert("LD_PRELOAD".into(), "/tmp/evil.so".into());
+        env.insert("LD_LIBRARY_PATH".into(), "/tmp".into());
+        env.insert("PYTHONPATH".into(), "/tmp/pylib".into());
+        env.insert("TERM".into(), "xterm".into());
+        env.insert("DISPLAY".into(), ":0".into());
+
+        sanitize_environment(&mut env);
+
+        assert!(env.contains_key(&OsString::from("HOME")));
+        assert!(env.contains_key(&OsString::from("PATH")));
+        assert!(env.contains_key(&OsString::from("TERM")));
+        assert!(env.contains_key(&OsString::from("DISPLAY")));
+        assert!(!env.contains_key(&OsString::from("LD_PRELOAD")));
+        assert!(!env.contains_key(&OsString::from("LD_LIBRARY_PATH")));
+        assert!(!env.contains_key(&OsString::from("PYTHONPATH")));
+    }
+
+    #[test]
+    fn sanitize_removes_bash_function_exports() {
+        let mut env = Environment::new();
+        env.insert("HOME".into(), "/root".into());
+        env.insert("BASH_FUNC_evil%%".into(), "() { evil_code; }".into());
+        env.insert("SAFE_VAR".into(), "normal_value".into());
+
+        sanitize_environment(&mut env);
+
+        assert!(env.contains_key(&OsString::from("HOME")));
+        assert!(env.contains_key(&OsString::from("SAFE_VAR")));
+        assert!(!env.contains_key(&OsString::from("BASH_FUNC_evil%%")));
     }
 
     #[test]
